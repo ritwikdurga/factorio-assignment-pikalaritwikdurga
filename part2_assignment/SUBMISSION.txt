@@ -1,0 +1,10 @@
+Name: Pikala Ritwik Durga
+Email: pikala_rd@cs.iitr.ac.in
+
+OS: macOS 26.0.1 (build 25A362)
+CPU: Apple M1 Pro (8 cores, 8 threads)
+RAM: 16 GB
+
+Language & version: Python 3.9.6 (official CPython for macOS ARM64)
+
+Notes: Uses SciPy HiGHS via scipy.optimize.linprog for both LP formulations.

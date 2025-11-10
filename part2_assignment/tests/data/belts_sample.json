@@ -1,0 +1,18 @@
+{
+    "sources": {
+      "s1": 900,
+      "s2": 600
+    },
+    "sink": "sink",
+    "node_caps": {
+      "a": {"throughput": 1500}
+    },
+    "edges": [
+      {"from": "s1", "to": "a", "lower": 0, "upper": 900},
+      {"from": "s2", "to": "a", "lower": 0, "upper": 600},
+      {"from": "a", "to": "b", "lower": 0, "upper": 900},
+      {"from": "b", "to": "sink", "lower": 0, "upper": 900},
+      {"from": "a", "to": "c", "lower": 0, "upper": 600},
+      {"from": "c", "to": "sink", "lower": 0, "upper": 600}
+    ]
+  }
