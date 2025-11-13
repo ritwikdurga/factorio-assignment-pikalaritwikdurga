@@ -1,10 +1,9 @@
-# belts/main.py
-
 import json
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import numpy as np
 from scipy.optimize import linprog
 
 TOL = 1e-9
@@ -58,16 +57,21 @@ class BeltOptimizer:
 
     def optimize(self) -> Dict:
         """Main optimization using linear programming"""
-        # Objective: minimize sum of flows (with tie-breaking)
-        c = [TIE_EPS * (i + 1) for i in range(self.num_edges)]
+        # Objective: maximize flow to sink (negative for minimization)
+        c = []
+        for i, edge in enumerate(self.edges):
+            if edge.dst == self.sink:
+                c.append(-1.0)  # Maximize sink flow
+            else:
+                c.append(TIE_EPS * (i + 1))  # Tie-breaking
         
         # Bounds: lower <= flow <= upper
         bounds = [(e.lower, e.upper) for e in self.edges]
         
-        # Equality constraints: flow conservation at each node
+        # Equality constraints: flow conservation at intermediate nodes
         A_eq, b_eq = self._build_conservation()
         
-        # Inequality constraints: node capacity limits
+        # Inequality constraints: source limits and node capacity limits
         A_ub, b_ub = self._build_capacity_constraints()
         
         result = linprog(
@@ -81,23 +85,34 @@ class BeltOptimizer:
         )
         
         if not result.success:
-            # Complete infeasibility
-            return self._format_infeasible(np.zeros(self.num_edges))
+            # LP failed - shouldn't happen with proper formulation
+            flows = np.array([e.lower for e in self.edges])
+            total_flow = self._compute_total_flow(flows)
+            return self._format_infeasible(flows, total_flow)
         
         flows = result.x
         total_flow = self._compute_total_flow(flows)
         
+        # Check if we achieved full supply routing
         if abs(total_flow - self.total_supply) < TOL:
             return self._format_success(flows, total_flow)
         else:
-            return self._format_infeasible(flows)
+            return self._format_infeasible(flows, total_flow)
 
     def _build_conservation(self) -> Tuple[List[List[float]], List[float]]:
-        """Build flow conservation constraints"""
+        """Build flow conservation constraints
+        
+        Only for intermediate nodes (not sources or sink):
+        inflow = outflow
+        """
         A_eq = []
         b_eq = []
         
         for node in self.nodes:
+            # Skip sources and sink
+            if node in self.sources or node == self.sink:
+                continue
+                
             row = [0.0] * self.num_edges
             for i, edge in enumerate(self.edges):
                 if edge.src == node:
@@ -105,23 +120,27 @@ class BeltOptimizer:
                 if edge.dst == node:
                     row[i] -= 1.0  # Inflow
             
-            # RHS: supply - demand
-            rhs = 0.0
-            if node in self.sources:
-                rhs += self.sources[node]
-            if node == self.sink:
-                rhs -= self.total_supply
-            
+            # Intermediate nodes: inflow = outflow (balance = 0)
             A_eq.append(row)
-            b_eq.append(rhs)
+            b_eq.append(0.0)
         
         return A_eq, b_eq
 
     def _build_capacity_constraints(self) -> Tuple[List[List[float]], List[float]]:
-        """Build node capacity constraints"""
+        """Build node capacity constraints and source limits"""
         A_ub = []
         b_ub = []
         
+        # Source output limits: outflow from source <= supply
+        for source, supply in self.sources.items():
+            row = [0.0] * self.num_edges
+            for i, edge in enumerate(self.edges):
+                if edge.src == source:
+                    row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(supply)
+        
+        # Node capacity constraints
         for node, caps in self.node_caps.items():
             if "throughput" in caps:
                 limit = caps["throughput"]
@@ -175,22 +194,22 @@ class BeltOptimizer:
                 flow_list.append({
                     "from": edge.src,
                     "to": edge.dst,
-                    "flow": float(flow),
+                    "flow": round(float(flow), 9),
                 })
         flow_list.sort(key=lambda x: (x["from"], x["to"]))
         
         return {
             "status": "ok",
-            "max_flow_per_min": float(total_flow),
+            "max_flow_per_min": round(float(total_flow), 9),
             "flows": flow_list,
         }
 
-    def _format_infeasible(self, flows: List[float]) -> Dict:
+    def _format_infeasible(self, flows: List[float], total_flow: float) -> Dict:
         """Format infeasible solution with cut certificate"""
         # Build residual graph
         residual = self._build_residual_graph(flows)
         
-        # Find reachable nodes from sources via BFS
+        # Find reachable nodes from sources via BFS in residual graph
         reachable = set()
         queue = deque(list(self.sources.keys()))
         reachable.update(queue)
@@ -205,7 +224,6 @@ class BeltOptimizer:
         cut_nodes = sorted([n for n in reachable if n in self.nodes])
         
         # Compute deficit
-        total_flow = self._compute_total_flow(flows)
         deficit = self.total_supply - total_flow
         
         # Find tight nodes and edges
@@ -214,9 +232,10 @@ class BeltOptimizer:
         
         return {
             "status": "infeasible",
+            "max_flow_per_min": round(float(total_flow), 9),
             "cut_reachable": cut_nodes,
             "deficit": {
-                "demand_balance": float(deficit),
+                "demand_balance": round(float(deficit), 9),
                 "tight_nodes": tight_nodes,
                 "tight_edges": tight_edges,
             },
@@ -266,16 +285,55 @@ class BeltOptimizer:
         return sorted(set(tight))
 
     def _find_tight_edges(self, flows: List[float], reachable: set, deficit: float) -> List[Dict]:
-        """Find edges at capacity crossing the cut"""
+        """Find edges at capacity that are bottlenecks"""
         tight = []
         
+        # First, find edges crossing the min-cut (reachable -> unreachable) at capacity
         for i, edge in enumerate(self.edges):
             if edge.src in reachable and edge.dst not in reachable:
                 if flows[i] >= edge.upper - TOL:
                     tight.append({
                         "from": edge.src,
                         "to": edge.dst,
-                        "flow_needed": float(deficit),
+                        "flow_needed": round(float(deficit), 9),
+                    })
+        
+        # If no crossing edges, look for internal bottlenecks
+        if not tight:
+            tight_nodes = self._find_tight_nodes(flows, reachable)
+            
+            # For each tight node, find edges limited by its capacity
+            for node in tight_nodes:
+                node_caps = self.node_caps.get(node, {})
+                
+                # If it has an output cap, find outgoing edges
+                if "out" in node_caps:
+                    for i, edge in enumerate(self.edges):
+                        if edge.src == node and flows[i] > TOL:
+                            tight.append({
+                                "from": edge.src,
+                                "to": edge.dst,
+                                "flow_needed": round(float(deficit), 9),
+                            })
+                # If it has throughput cap, find any edges from it
+                elif "throughput" in node_caps:
+                    for i, edge in enumerate(self.edges):
+                        if edge.src == node and flows[i] > TOL:
+                            tight.append({
+                                "from": edge.src,
+                                "to": edge.dst,
+                                "flow_needed": round(float(deficit), 9),
+                            })
+                            break
+        
+        # Final fallback: any saturated edge from reachable set
+        if not tight:
+            for i, edge in enumerate(self.edges):
+                if edge.src in reachable and flows[i] >= edge.upper - TOL:
+                    tight.append({
+                        "from": edge.src,
+                        "to": edge.dst,
+                        "flow_needed": round(float(deficit), 9),
                     })
         
         tight.sort(key=lambda x: (x["from"], x["to"]))
