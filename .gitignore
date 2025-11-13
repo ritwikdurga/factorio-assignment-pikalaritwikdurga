@@ -41,3 +41,5 @@ part2_assignment/venv/
 .DS_Store
 Thumbs.db
 
+# Debug files
+debug_belts.py
