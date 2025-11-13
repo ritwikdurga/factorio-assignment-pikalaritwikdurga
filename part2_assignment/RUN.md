@@ -2,11 +2,11 @@
 
 ```bash
 # 1. Install dependencies (optional virtualenv recommended)
-# Install required dependencies based on the need. 
+python3 -m pip install -r requirements.txt
 
 # 2. Run provided sample fixtures for both tools
-python run_samples.py "python factory/main.py" "python belts/main.py"
+python3 run_samples.py "python3 factory/main.py" "python3 belts/main.py"
 
 # 3. Execute the automated test suite
-FACTORY_CMD="python factory/main.py" BELTS_CMD="python belts/main.py" pytest -q
+FACTORY_CMD="python3 factory/main.py" BELTS_CMD="python3 belts/main.py" python3 -m pytest -q
 ```

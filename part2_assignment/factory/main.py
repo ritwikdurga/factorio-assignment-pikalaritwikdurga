@@ -1,3 +1,5 @@
+# factory/main.py
+
 import json
 import sys
 from collections import defaultdict
@@ -13,283 +15,324 @@ TIE_EPS = 1e-6
 
 
 @dataclass(frozen=True)
-class ProductionInfo:
-    title: str
-    device: str
-    requirements: Dict[str, float]
-    yields: Dict[str, float]
-    productivity: float
+class RecipeInfo:
+    name: str
+    machine: str
+    inputs: Dict[str, float]
+    outputs: Dict[str, float]
+    effective_crafts_per_min: float
+    prod_multiplier: float
 
 
-class ProductionOptimizer:
+class FactoryOptimizer:
     def __init__(self, config: Dict):
         self.config = config
-        self.available_devices = config["machines"]
-        self.recipe_specs = config["recipes"]
-        self.enhancements = config.get("modules", {})
-        constraints = config.get("limits", {})
-        self.resource_limits = constraints.get("raw_supply_per_min", {})
-        self.device_limits = constraints.get("max_machines", {})
-        goal = config["target"]
-        self.desired_product = goal["item"]
-        self.required_output = float(goal["rate_per_min"])
+        self.machines = config["machines"]
+        self.recipes_raw = config["recipes"]
+        self.modules = config.get("modules", {})
+        limits = config.get("limits", {})
+        self.raw_supply = limits.get("raw_supply_per_min", {})
+        self.max_machines = limits.get("max_machines", {})
+        target = config["target"]
+        self.target_item = target["item"]
+        self.target_rate = float(target["rate_per_min"])
 
-        self.production_methods = sorted(self.recipe_specs.keys())
-        self.method_to_index = {title: idx for idx, title in enumerate(self.production_methods)}
+        # Process recipes
+        self.recipe_names = sorted(self.recipes_raw.keys())
+        self.recipes: List[RecipeInfo] = []
+        self.machine_to_recipes: Dict[str, List[str]] = defaultdict(list)
+        self.all_items = set()
 
-        self.processed_recipes: List[ProductionInfo] = []
-        self.devices_to_methods: Dict[str, List[str]] = defaultdict(list)
-        self.materials = set()
-
-        for title in self.production_methods:
-            details = self.recipe_specs[title]
-            device = details["machine"]
-            if device not in self.available_devices:
-                raise ValueError(f"device '{device}' missing for recipe '{title}'")
-
-            requirements = {k: float(v) for k, v in details.get("in", {}).items()}
-            yields = {k: float(v) for k, v in details.get("out", {}).items()}
-            if not yields:
-                raise ValueError(f"recipe '{title}' must produce at least one item")
-
-            enhancement = self.enhancements.get(device, {})
-            yield_multiplier = 1.0 + float(enhancement.get("prod", 0.0))
-            adjusted_yields = {material: qty * yield_multiplier for material, qty in yields.items()}
-
-            base_efficiency = float(self.available_devices[device]["crafts_per_min"])
-            efficiency_multiplier = 1.0 + float(enhancement.get("speed", 0.0))
-            duration = float(details["time_s"])
-            if duration <= 0:
-                raise ValueError(f"recipe '{title}' has non-positive time_s")
-            productivity = base_efficiency * efficiency_multiplier * 60.0 / duration
-            if productivity <= 0:
-                raise ValueError(f"recipe '{title}' has non-positive effective rate")
-
-            info = ProductionInfo(
-                title=title,
-                device=device,
-                requirements=requirements,
-                yields=adjusted_yields,
-                productivity=productivity,
+        for name in self.recipe_names:
+            spec = self.recipes_raw[name]
+            machine = spec["machine"]
+            
+            inputs = {k: float(v) for k, v in spec.get("in", {}).items()}
+            outputs = {k: float(v) for k, v in spec.get("out", {}).items()}
+            
+            # Calculate effective crafts per minute
+            base_speed = float(self.machines[machine]["crafts_per_min"])
+            module = self.modules.get(machine, {})
+            speed_bonus = float(module.get("speed", 0.0))
+            prod_bonus = float(module.get("prod", 0.0))
+            time_s = float(spec["time_s"])
+            
+            effective_crafts_per_min = base_speed * (1 + speed_bonus) * 60.0 / time_s
+            prod_multiplier = 1.0 + prod_bonus
+            
+            recipe = RecipeInfo(
+                name=name,
+                machine=machine,
+                inputs=inputs,
+                outputs=outputs,
+                effective_crafts_per_min=effective_crafts_per_min,
+                prod_multiplier=prod_multiplier,
             )
-            self.processed_recipes.append(info)
-            self.devices_to_methods[device].append(title)
-            self.materials.update(requirements.keys())
-            self.materials.update(yields.keys())
+            self.recipes.append(recipe)
+            self.machine_to_recipes[machine].append(name)
+            self.all_items.update(inputs.keys())
+            self.all_items.update(outputs.keys())
 
-        self.variable_bounds = [(0.0, None)] * len(self.processed_recipes)
-        self.objective_coeffs = self._construct_objective()
-        self.eq_matrix, self.balanced_materials = self._construct_balance_eqs()
-        self.ineq_matrix, self.ineq_bounds = self._construct_resource_ineqs()
+        # Find target recipe
+        self.target_recipe_idx = None
+        for i, recipe in enumerate(self.recipes):
+            if self.target_item in recipe.outputs:
+                self.target_recipe_idx = i
+                break
 
-    def _construct_objective(self) -> List[float]:
-        factors = []
-        for idx, info in enumerate(self.processed_recipes, start=1):
-            device_usage = 1.0 / info.productivity
-            factors.append(device_usage + TIE_EPS * idx)
-        return factors
+        # Build LP
+        self.bounds = [(0.0, None)] * len(self.recipes)
+        self.objective = self._build_objective()
+        self.A_eq, self.b_eq_items = self._build_conservation()
+        self.A_ub, self.b_ub = self._build_constraints()
 
-    def _construct_balance_eqs(self) -> Tuple[List[List[float]], List[str]]:
-        balanced_materials: List[str] = []
-        eq_rows: List[List[float]] = []
+    def _build_objective(self) -> List[float]:
+        """Minimize total machines used, with tie-breaking"""
+        obj = []
+        for i, recipe in enumerate(self.recipes, start=1):
+            machines_per_craft = 1.0 / recipe.effective_crafts_per_min
+            obj.append(machines_per_craft + TIE_EPS * i)
+        return obj
 
-        def material_balance(material: str) -> List[float]:
-            row = []
-            for info in self.processed_recipes:
-                generated = info.yields.get(material, 0.0)
-                required = info.requirements.get(material, 0.0)
-                row.append(generated - required)
-            return row
+    def _build_conservation(self) -> Tuple[List[List[float]], List[str]]:
+        """Build conservation equations WITH productivity bonuses"""
+        items_to_balance = []
+        A_eq = []
 
-        if self.desired_product not in balanced_materials:
-            balanced_materials.append(self.desired_product)
-            eq_rows.append(material_balance(self.desired_product))
+        # Target item equation
+        items_to_balance.append(self.target_item)
+        row = []
+        for recipe in self.recipes:
+            out_amt = recipe.outputs.get(self.target_item, 0.0) * recipe.prod_multiplier
+            in_amt = recipe.inputs.get(self.target_item, 0.0)
+            row.append(out_amt - in_amt)
+        A_eq.append(row)
 
+        # Intermediate items (not raw, not target)
         intermediates = (
-            self.materials
-            - set(self.resource_limits.keys())
-            - {self.desired_product}
+            self.all_items
+            - set(self.raw_supply.keys())
+            - {self.target_item}
         )
-        for material in sorted(intermediates):
-            balanced_materials.append(material)
-            eq_rows.append(material_balance(material))
-
-        return eq_rows, balanced_materials
-
-    def _construct_resource_ineqs(self) -> Tuple[List[List[float]], List[float]]:
-        ineq_rows: List[List[float]] = []
-        bound_values: List[float] = []
-
-        def material_balance(material: str) -> List[float]:
+        for item in sorted(intermediates):
+            items_to_balance.append(item)
             row = []
-            for info in self.processed_recipes:
-                generated = info.yields.get(material, 0.0)
-                required = info.requirements.get(material, 0.0)
-                row.append(generated - required)
-            return row
+            for recipe in self.recipes:
+                out_amt = recipe.outputs.get(item, 0.0) * recipe.prod_multiplier
+                in_amt = recipe.inputs.get(item, 0.0)
+                row.append(out_amt - in_amt)
+            A_eq.append(row)
 
-        for material, limit in self.resource_limits.items():
-            row = material_balance(material)
-            ineq_rows.append(row)
-            bound_values.append(0.0)
-            ineq_rows.append([-factor for factor in row])
-            bound_values.append(float(limit))
+        return A_eq, items_to_balance
 
-        for device, limit in self.device_limits.items():
-            limit_val = float(limit)
-            if limit_val < 0:
-                raise ValueError(f"negative machine cap for '{device}'")
+    def _build_constraints(self) -> Tuple[List[List[float]], List[float]]:
+        """Build inequality constraints for raw materials and machines"""
+        A_ub = []
+        b_ub = []
+
+        # Raw material constraints (net consumption <= supply)
+        for item, supply in self.raw_supply.items():
             row = []
-            methods = {title for title in self.devices_to_methods.get(device, [])}
-            for info in self.processed_recipes:
-                if info.title in methods:
-                    row.append(1.0 / info.productivity)
+            for recipe in self.recipes:
+                out_amt = recipe.outputs.get(item, 0.0) * recipe.prod_multiplier
+                in_amt = recipe.inputs.get(item, 0.0)
+                row.append(out_amt - in_amt)
+            A_ub.append([-x for x in row])
+            b_ub.append(float(supply))
+
+        # Machine constraints
+        for machine, limit in self.max_machines.items():
+            row = []
+            for recipe in self.recipes:
+                if recipe.machine == machine:
+                    row.append(1.0 / recipe.effective_crafts_per_min)
                 else:
                     row.append(0.0)
-            ineq_rows.append(row)
-            bound_values.append(limit_val)
+            A_ub.append(row)
+            b_ub.append(float(limit))
 
-        return ineq_rows, bound_values
+        return A_ub, b_ub
 
-    def _optimize_for_output(self, output: float):
-        rhs_eq = []
-        for material in self.balanced_materials:
-            if material == self.desired_product:
-                rhs_eq.append(output)
+    def _solve_for_rate(self, target_rate: float):
+        """Solve LP for a specific target rate (in items/min with productivity)"""
+        b_eq = []
+        for item in self.b_eq_items:
+            if item == self.target_item:
+                b_eq.append(target_rate)
             else:
-                rhs_eq.append(0.0)
+                b_eq.append(0.0)
 
-        return linprog(
-            self.objective_coeffs,
-            A_ub=self.ineq_matrix if self.ineq_matrix else None,
-            b_ub=self.ineq_bounds if self.ineq_bounds else None,
-            A_eq=self.eq_matrix if self.eq_matrix else None,
-            b_eq=rhs_eq if rhs_eq else None,
-            bounds=self.variable_bounds,
+        result = linprog(
+            self.objective,
+            A_ub=self.A_ub if self.A_ub else None,
+            b_ub=self.b_ub if self.b_ub else None,
+            A_eq=self.A_eq if self.A_eq else None,
+            b_eq=b_eq if b_eq else None,
+            bounds=self.bounds,
             method="highs",
         )
+        return result
 
     def optimize(self) -> Dict:
-        exact = self._optimize_for_output(self.required_output)
-        if exact.success and self._validate_result(exact.x, self.required_output):
-            return self._format_optimal(exact.x)
+        """Main optimization routine"""
+        # Try exact target first
+        result = self._solve_for_rate(self.target_rate)
+        
+        if result.success and self._validate_solution(result.x, self.target_rate):
+            return self._format_success(result.x)
 
-        max_output = 0.0
-        optimal_result = None
-        min_bound, max_bound = 0.0, self.required_output
-        for _ in range(50):
-            midpoint = (min_bound + max_bound) / 2.0
-            outcome = self._optimize_for_output(midpoint)
-            if outcome.success and self._validate_result(outcome.x, midpoint):
-                max_output = midpoint
-                optimal_result = outcome.x
-                min_bound = midpoint
+        # Binary search for maximum feasible rate
+        lo, hi = 0.0, self.target_rate
+        best_x = None
+        best_rate = 0.0
+
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            result = self._solve_for_rate(mid)
+            
+            if result.success and self._validate_solution(result.x, mid):
+                best_rate = mid
+                best_x = result.x
+                lo = mid
             else:
-                max_bound = midpoint
+                hi = mid
+            
+            if hi - lo < 1e-6:
+                break
 
-        if optimal_result is None:
-            zero_outcome = self._optimize_for_output(0.0)
-            optimal_result = zero_outcome.x if zero_outcome.success else np.zeros(len(self.processed_recipes))
-            max_output = 0.0
+        if best_x is None:
+            best_x = np.zeros(len(self.recipes))
+            best_rate = 0.0
 
-        return self._format_suboptimal(max_output, optimal_result)
+        return self._format_infeasible(best_rate, best_x)
 
-    def _validate_result(self, solution: np.ndarray, desired_output: float) -> bool:
-        solution = np.array(solution)
-        if np.any(solution < -1e-7):
+    def _validate_solution(self, x: np.ndarray, target_rate: float) -> bool:
+        """Validate solution satisfies all constraints"""
+        if np.any(x < -TOL):
             return False
 
-        for material, row in zip(self.balanced_materials, self.eq_matrix):
-            left_side = float(np.dot(row, solution))
-            right_side = desired_output if material == self.desired_product else 0.0
-            if abs(left_side - right_side) > 5e-7:
+        # Check conservation equations
+        for item, row in zip(self.b_eq_items, self.A_eq):
+            lhs = float(np.dot(row, x))
+            rhs = target_rate if item == self.target_item else 0.0
+            if abs(lhs - rhs) > TOL:
                 return False
 
-        if self.ineq_matrix:
-            left_sides = np.dot(self.ineq_matrix, solution)
-            for val, bound in zip(left_sides, self.ineq_bounds):
-                if val - bound > 1e-6:
+        # Check inequality constraints
+        if self.A_ub:
+            lhs_vals = np.dot(self.A_ub, x)
+            for lhs, rhs in zip(lhs_vals, self.b_ub):
+                if lhs > rhs + TOL:
                     return False
 
         return True
 
-    def _format_optimal(self, solution: np.ndarray) -> Dict:
-        method_rates = self._method_outputs(solution)
-        device_counts = self._device_requirements(solution)
-        resource_usage = self._resource_demand(solution)
+    def _format_success(self, x: np.ndarray) -> Dict:
+        """Format successful solution"""
+        crafts = {}
+        for recipe, val in zip(self.recipes, x):
+            crafts[recipe.name] = 0.0 if abs(val) < TOL else float(val)
+
+        machines = defaultdict(float)
+        for recipe, val in zip(self.recipes, x):
+            if val > TOL:
+                machines[recipe.machine] += val / recipe.effective_crafts_per_min
+
+        raw_consumption = {}
+        for item in sorted(self.raw_supply.keys()):
+            net = 0.0
+            for recipe, val in zip(self.recipes, x):
+                out_amt = recipe.outputs.get(item, 0.0) * recipe.prod_multiplier
+                in_amt = recipe.inputs.get(item, 0.0)
+                net += (in_amt - out_amt) * val
+            raw_consumption[item] = 0.0 if abs(net) < TOL else float(net)
+
         return {
             "status": "ok",
-            "per_recipe_crafts_per_min": method_rates,
-            "per_machine_counts": device_counts,
-            "raw_consumption_per_min": resource_usage,
+            "per_recipe_crafts_per_min": crafts,
+            "per_machine_counts": {m: float(c) for m, c in sorted(machines.items())},
+            "raw_consumption_per_min": raw_consumption,
         }
 
-    def _format_suboptimal(self, output: float, solution: np.ndarray) -> Dict:
-        method_rates = self._method_outputs(solution)
-        device_counts = self._device_requirements(solution)
-        resource_usage = self._resource_demand(solution)
+    def _format_infeasible(self, max_rate: float, x: np.ndarray) -> Dict:
+        """Format infeasible solution with bottleneck hints"""
+        crafts = {}
+        for recipe, val in zip(self.recipes, x):
+            crafts[recipe.name] = 0.0 if abs(val) < TOL else float(val)
 
-        clues: List[str] = []
-        for device, count in device_counts.items():
-            limit = self.device_limits.get(device)
-            if limit is None:
-                continue
-            if count >= float(limit) - 1e-6:
-                clues.append(f"{device} cap")
+        machines = defaultdict(float)
+        for recipe, val in zip(self.recipes, x):
+            if val > TOL:
+                machines[recipe.machine] += val / recipe.effective_crafts_per_min
 
-        for material, limit in self.resource_limits.items():
-            used = resource_usage.get(material, 0.0)
-            if used >= float(limit) - 1e-6:
-                clues.append(f"{material} supply")
+        raw_consumption = {}
+        for item in sorted(self.raw_supply.keys()):
+            net = 0.0
+            for recipe, val in zip(self.recipes, x):
+                out_amt = recipe.outputs.get(item, 0.0) * recipe.prod_multiplier
+                in_amt = recipe.inputs.get(item, 0.0)
+                net += (in_amt - out_amt) * val
+            raw_consumption[item] = 0.0 if abs(net) < TOL else float(net)
 
-        clues = sorted(set(clues))
+        # Find bottlenecks - check which constraints are tight when trying higher rate
+        hints = []
+        
+        # Try to solve at target rate to see what's blocking us
+        target_result = self._solve_for_rate(self.target_rate)
+        
+        if target_result.success:
+            # Check constraints with the target solution
+            test_x = target_result.x
+            
+            # Check machine constraints
+            for machine, limit in self.max_machines.items():
+                machine_usage = 0.0
+                for recipe, val in zip(self.recipes, test_x):
+                    if recipe.machine == machine:
+                        machine_usage += val / recipe.effective_crafts_per_min
+                if machine_usage > limit - TOL:
+                    hints.append(f"{machine} cap")
+            
+            # Check raw material constraints
+            for item, supply in self.raw_supply.items():
+                net = 0.0
+                for recipe, val in zip(self.recipes, test_x):
+                    out_amt = recipe.outputs.get(item, 0.0) * recipe.prod_multiplier
+                    in_amt = recipe.inputs.get(item, 0.0)
+                    net += (in_amt - out_amt) * val
+                if net > supply - TOL:
+                    hints.append(f"{item} supply")
+        else:
+            # Solver failed - check which constraints would be violated
+            # by checking the dual values or by examining current solution
+            for machine, count in machines.items():
+                limit = self.max_machines.get(machine)
+                if limit:
+                    # Check if we're close to limit (within 10%)
+                    if count >= limit * 0.9:
+                        hints.append(f"{machine} cap")
+
+            for item, consumption in raw_consumption.items():
+                supply = self.raw_supply.get(item, 0.0)
+                if consumption >= supply * 0.9:
+                    hints.append(f"{item} supply")
 
         return {
             "status": "infeasible",
-            "max_feasible_target_per_min": float(output),
-            "bottleneck_hint": clues,
-            "per_recipe_crafts_per_min": method_rates,
-            "per_machine_counts": device_counts,
-            "raw_consumption_per_min": resource_usage,
+            "max_feasible_target_per_min": float(max_rate),
+            "bottleneck_hint": sorted(set(hints)),
         }
 
-    def _method_outputs(self, solution: np.ndarray) -> Dict[str, float]:
-        output_dict = {}
-        for info, value in zip(self.processed_recipes, solution):
-            val = 0.0 if abs(value) < 1e-9 else float(value)
-            output_dict[info.title] = val
-        return {k: output_dict[k] for k in sorted(output_dict.keys())}
 
-    def _device_requirements(self, solution: np.ndarray) -> Dict[str, float]:
-        requirements = defaultdict(float)
-        for info, output in zip(self.processed_recipes, solution):
-            devices_required = output / info.productivity
-            if devices_required > 1e-12:
-                requirements[info.device] += devices_required
-        return {device: float(val) for device, val in sorted(requirements.items())}
-
-    def _resource_demand(self, solution: np.ndarray) -> Dict[str, float]:
-        demand = {}
-        for material in self.resource_limits.keys():
-            total = 0.0
-            for info, output in zip(self.processed_recipes, solution):
-                generated = info.yields.get(material, 0.0) * output
-                required = info.requirements.get(material, 0.0) * output
-                total += required - generated
-            total = 0.0 if abs(total) < 1e-9 else float(total)
-            demand[material] = total
-        return {k: demand[k] for k in sorted(demand.keys())}
-
-
-def entry() -> None:
+def main():
     try:
         config = json.load(sys.stdin)
-        optimizer = ProductionOptimizer(config)
-        outcome = optimizer.optimize()
-    except Exception as error:  # noqa: BLE001
-        outcome = {"status": "error", "message": str(error)}
-    json.dump(outcome, sys.stdout, separators=(",", ":"))
+        optimizer = FactoryOptimizer(config)
+        result = optimizer.optimize()
+    except Exception as e:
+        result = {"status": "error", "message": str(e)}
+    json.dump(result, sys.stdout, separators=(",", ":"))
 
 
 if __name__ == "__main__":
-    entry()
+    main()

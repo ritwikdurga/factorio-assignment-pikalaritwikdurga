@@ -139,12 +139,12 @@ part2_assignment/
 
 1. Create a virtual environment (recommended) and install dependencies:  
 
-   `python -m pip install -r requirements.txt`
+   `python3 -m pip install -r requirements.txt`
 
 2. Run samples:  
 
-   `python run_samples.py "python factory/main.py" "python belts/main.py"`
+   `python3 run_samples.py "python3 factory/main.py" "python3 belts/main.py"`
 
 3. Execute the automated tests:  
 
-   `FACTORY_CMD="python factory/main.py" BELTS_CMD="python belts/main.py" pytest -q`
+   `FACTORY_CMD="python3 factory/main.py" BELTS_CMD="python3 belts/main.py" python3 -m pytest -q`

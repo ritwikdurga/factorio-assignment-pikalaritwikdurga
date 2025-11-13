@@ -1,3 +1,5 @@
+# belts/main.py
+
 import json
 import sys
 from collections import defaultdict, deque
@@ -8,287 +10,287 @@ from scipy.optimize import linprog
 TOL = 1e-9
 TIE_EPS = 1e-6
 
-@dataclass
-class Connection:
-    start: str
-    end: str
-    min_flow: float
-    max_flow: float
 
-class NetworkOptimizer:
+@dataclass
+class Edge:
+    src: str
+    dst: str
+    lower: float
+    upper: float
+
+
+class BeltOptimizer:
     def __init__(self, config: Dict):
         self.config = config
-        self.supplies: Dict[str, float] = {
-            key: float(val) for key, val in config.get("sources", {}).items()
+        self.sources: Dict[str, float] = {
+            k: float(v) for k, v in config.get("sources", {}).items()
         }
-        if not self.supplies:
-            raise ValueError("at least one source required")
-        self.supply_keys = sorted(self.supplies.keys())
-        self.demand = config["sink"]
-        self.capacity_limits = {
-            key: {
-                subkey: float(subval)
-                for subkey, subval in details.items()
-            }
-            for key, details in config.get("node_caps", {}).items()
+        if not self.sources:
+            raise ValueError("At least one source required")
+        
+        self.sink = config["sink"]
+        self.node_caps = {
+            node: {k: float(v) for k, v in caps.items()}
+            for node, caps in config.get("node_caps", {}).items()
         }
-        connections_raw = config.get("edges", [])
-        if not connections_raw:
-            raise ValueError("at least one edge required")
-        self.connections: List[Connection] = []
-        self.vertices = set(self.supplies.keys()) | {self.demand}
-        for details in connections_raw:
-            start = details["from"]
-            end = details["to"]
-            min_flow = float(details.get("lower", 0.0))
-            max_flow = float(details["upper"])
-            if max_flow < min_flow - 1e-9:
-                raise ValueError(f"edge {start}->{end} has upper < lower")
-            self.connections.append(Connection(start, end, min_flow, max_flow))
-            self.vertices.add(start)
-            self.vertices.add(end)
-        self.vertices = sorted(self.vertices)
-        self.overall_supply = sum(self.supplies.values())
-        if self.overall_supply < 0:
-            raise ValueError("total supply must be non-negative")
-        self.connection_count = len(self.connections)
-        self.supply_map = {key: idx for idx, key in enumerate(self.supply_keys)}
-        self.unused_var_start = self.connection_count + len(self.supply_keys)
-        self.total_vars = self.unused_var_start + 1
+        
+        edges_raw = config.get("edges", [])
+        if not edges_raw:
+            raise ValueError("At least one edge required")
+        
+        self.edges: List[Edge] = []
+        self.nodes = set(self.sources.keys()) | {self.sink}
+        
+        for e in edges_raw:
+            src = e["from"]
+            dst = e["to"]
+            lower = float(e.get("lower", 0.0))
+            upper = float(e["upper"])
+            if upper < lower - TOL:
+                raise ValueError(f"Edge {src}->{dst} has upper < lower")
+            self.edges.append(Edge(src, dst, lower, upper))
+            self.nodes.add(src)
+            self.nodes.add(dst)
+        
+        self.nodes = sorted(self.nodes)
+        self.total_supply = sum(self.sources.values())
+        self.num_edges = len(self.edges)
 
     def optimize(self) -> Dict:
-        objective = [TIE_EPS * (idx + 1) for idx in range(self.connection_count)]
-        for idx in range(len(self.supply_keys)):
-            objective.append(TIE_EPS * (self.connection_count + idx + 1))
-        objective.append(-1.0)
-        var_bounds = []
-        for conn in self.connections:
-            var_bounds.append((conn.min_flow, conn.max_flow))
-        for key in self.supply_keys:
-            amount = self.supplies[key]
-            var_bounds.append((0.0, amount))
-        var_bounds.append((0.0, self.overall_supply))
-        eq_matrix, eq_rhs = self._create_eq_constraints()
-        ineq_matrix, ineq_rhs = self._create_ineq_constraints()
-        opt_result = linprog(
-            objective,
-            A_ub=ineq_matrix if ineq_matrix else None,
-            b_ub=ineq_rhs if ineq_rhs else None,
-            A_eq=eq_matrix if eq_matrix else None,
-            b_eq=eq_rhs if eq_rhs else None,
-            bounds=var_bounds,
+        """Main optimization using linear programming"""
+        # Objective: minimize sum of flows (with tie-breaking)
+        c = [TIE_EPS * (i + 1) for i in range(self.num_edges)]
+        
+        # Bounds: lower <= flow <= upper
+        bounds = [(e.lower, e.upper) for e in self.edges]
+        
+        # Equality constraints: flow conservation at each node
+        A_eq, b_eq = self._build_conservation()
+        
+        # Inequality constraints: node capacity limits
+        A_ub, b_ub = self._build_capacity_constraints()
+        
+        result = linprog(
+            c,
+            A_ub=A_ub if A_ub else None,
+            b_ub=b_ub if b_ub else None,
+            A_eq=A_eq if A_eq else None,
+            b_eq=b_eq if b_eq else None,
+            bounds=bounds,
             method="highs",
         )
-        if not opt_result.success:
-            return {
-                "status": "infeasible",
-                "reachable_set": [],
-                "shortfall": {
-                    "balance_needed": self.overall_supply,
-                    "saturated_vertices": [],
-                    "saturated_connections": [],
-                },
-            }
-        conn_flows = opt_result.x[: self.connection_count]
-        leftovers = opt_result.x[self.connection_count : self.unused_var_start]
-        achieved = float(opt_result.x[self.unused_var_start])
-        shortfall = max(0.0, self.overall_supply - achieved)
-        rounded_flows = [0.0 if abs(val) < 1e-9 else float(val) for val in conn_flows]
-        rounded_leftovers = [max(0.0, float(l)) for l in leftovers]
-        if shortfall <= 1e-6:
-            return self._format_optimal(rounded_flows, achieved)
-        return self._format_suboptimal(rounded_flows, rounded_leftovers, achieved, shortfall)
+        
+        if not result.success:
+            # Complete infeasibility
+            return self._format_infeasible(np.zeros(self.num_edges))
+        
+        flows = result.x
+        total_flow = self._compute_total_flow(flows)
+        
+        if abs(total_flow - self.total_supply) < TOL:
+            return self._format_success(flows, total_flow)
+        else:
+            return self._format_infeasible(flows)
 
-    def _create_eq_constraints(self) -> Tuple[List[List[float]], List[float]]:
-        constraint_rows: List[List[float]] = []
-        right_sides: List[float] = []
-        for vert in self.vertices:
-            row = [0.0] * self.total_vars
-            for idx, conn in enumerate(self.connections):
-                if conn.start == vert:
-                    row[idx] += 1.0
-                if conn.end == vert:
-                    row[idx] -= 1.0
-            if vert in self.supplies:
-                leftover_idx = self.connection_count + self.supply_map[vert]
-                row[leftover_idx] += 1.0
-                right_sides.append(self.supplies[vert])
-            elif vert == self.demand:
-                row[self.unused_var_start] += 1.0
-                right_sides.append(0.0)
-            else:
-                right_sides.append(0.0)
-            constraint_rows.append(row)
-        return constraint_rows, right_sides
+    def _build_conservation(self) -> Tuple[List[List[float]], List[float]]:
+        """Build flow conservation constraints"""
+        A_eq = []
+        b_eq = []
+        
+        for node in self.nodes:
+            row = [0.0] * self.num_edges
+            for i, edge in enumerate(self.edges):
+                if edge.src == node:
+                    row[i] += 1.0  # Outflow
+                if edge.dst == node:
+                    row[i] -= 1.0  # Inflow
+            
+            # RHS: supply - demand
+            rhs = 0.0
+            if node in self.sources:
+                rhs += self.sources[node]
+            if node == self.sink:
+                rhs -= self.total_supply
+            
+            A_eq.append(row)
+            b_eq.append(rhs)
+        
+        return A_eq, b_eq
 
-    def _create_ineq_constraints(self) -> Tuple[List[List[float]], List[float]]:
-        ineq_rows: List[List[float]] = []
-        bounds_rhs: List[float] = []
-        for vert, limits in self.capacity_limits.items():
-            if "throughput" in limits:
-                limit_val = limits["throughput"]
-                ineq_rows.append(self._inflow_row(vert))
-                bounds_rhs.append(limit_val)
-                ineq_rows.append(self._outflow_row(vert))
-                bounds_rhs.append(limit_val)
-            if "in" in limits:
-                ineq_rows.append(self._inflow_row(vert))
-                bounds_rhs.append(limits["in"])
-            if "out" in limits:
-                ineq_rows.append(self._outflow_row(vert))
-                bounds_rhs.append(limits["out"])
-        return ineq_rows, bounds_rhs
+    def _build_capacity_constraints(self) -> Tuple[List[List[float]], List[float]]:
+        """Build node capacity constraints"""
+        A_ub = []
+        b_ub = []
+        
+        for node, caps in self.node_caps.items():
+            if "throughput" in caps:
+                limit = caps["throughput"]
+                # Inflow <= limit
+                row_in = [0.0] * self.num_edges
+                for i, edge in enumerate(self.edges):
+                    if edge.dst == node:
+                        row_in[i] = 1.0
+                A_ub.append(row_in)
+                b_ub.append(limit)
+                
+                # Outflow <= limit
+                row_out = [0.0] * self.num_edges
+                for i, edge in enumerate(self.edges):
+                    if edge.src == node:
+                        row_out[i] = 1.0
+                A_ub.append(row_out)
+                b_ub.append(limit)
+            
+            if "in" in caps:
+                row = [0.0] * self.num_edges
+                for i, edge in enumerate(self.edges):
+                    if edge.dst == node:
+                        row[i] = 1.0
+                A_ub.append(row)
+                b_ub.append(caps["in"])
+            
+            if "out" in caps:
+                row = [0.0] * self.num_edges
+                for i, edge in enumerate(self.edges):
+                    if edge.src == node:
+                        row[i] = 1.0
+                A_ub.append(row)
+                b_ub.append(caps["out"])
+        
+        return A_ub, b_ub
 
-    def _inflow_row(self, vert: str) -> List[float]:
-        row = [0.0] * self.total_vars
-        for idx, conn in enumerate(self.connections):
-            if conn.end == vert:
-                row[idx] += 1.0
-        return row
+    def _compute_total_flow(self, flows: List[float]) -> float:
+        """Compute total flow reaching sink"""
+        total = 0.0
+        for i, edge in enumerate(self.edges):
+            if edge.dst == self.sink:
+                total += flows[i]
+        return total
 
-    def _outflow_row(self, vert: str) -> List[float]:
-        row = [0.0] * self.total_vars
-        for idx, conn in enumerate(self.connections):
-            if conn.start == vert:
-                row[idx] += 1.0
-        return row
-
-    def _format_optimal(self, flows: List[float], achieved: float) -> Dict:
-        output_flows = []
-        for conn, amt in zip(self.connections, flows):
-            if abs(amt) < 1e-9:
-                continue
-            output_flows.append(
-                {"from": conn.start, "to": conn.end, "flow": float(amt)}
-            )
-        output_flows.sort(key=lambda x: (x["from"], x["to"]))
+    def _format_success(self, flows: List[float], total_flow: float) -> Dict:
+        """Format successful solution"""
+        flow_list = []
+        for edge, flow in zip(self.edges, flows):
+            if abs(flow) > TOL:
+                flow_list.append({
+                    "from": edge.src,
+                    "to": edge.dst,
+                    "flow": float(flow),
+                })
+        flow_list.sort(key=lambda x: (x["from"], x["to"]))
+        
         return {
             "status": "ok",
-            "max_flow_per_min": float(achieved),
-            "flows": output_flows,
+            "max_flow_per_min": float(total_flow),
+            "flows": flow_list,
         }
 
-    def _format_suboptimal(
-        self,
-        flows: List[float],
-        leftovers: List[float],
-        achieved: float,
-        shortfall: float,
-    ) -> Dict:
-        inflow_totals, outflow_totals = self._vertex_totals(flows)
-        reachable = self._find_reachable(flows, leftovers, inflow_totals, outflow_totals)
-        cut_vertices = sorted(vert for vert in reachable if vert in self.vertices)
-        saturated_vertices = self._saturated_vertices(inflow_totals, outflow_totals, reachable)
-        saturated_connections = self._saturated_connections(flows, reachable, shortfall)
+    def _format_infeasible(self, flows: List[float]) -> Dict:
+        """Format infeasible solution with cut certificate"""
+        # Build residual graph
+        residual = self._build_residual_graph(flows)
+        
+        # Find reachable nodes from sources via BFS
+        reachable = set()
+        queue = deque(list(self.sources.keys()))
+        reachable.update(queue)
+        
+        while queue:
+            node = queue.popleft()
+            for neighbor, cap in residual.get(node, []):
+                if cap > TOL and neighbor not in reachable:
+                    reachable.add(neighbor)
+                    queue.append(neighbor)
+        
+        cut_nodes = sorted([n for n in reachable if n in self.nodes])
+        
+        # Compute deficit
+        total_flow = self._compute_total_flow(flows)
+        deficit = self.total_supply - total_flow
+        
+        # Find tight nodes and edges
+        tight_nodes = self._find_tight_nodes(flows, reachable)
+        tight_edges = self._find_tight_edges(flows, reachable, deficit)
+        
         return {
             "status": "infeasible",
-            "max_flow_per_min": float(achieved),
-            "cut_reachable": cut_vertices,
+            "cut_reachable": cut_nodes,
             "deficit": {
-                "demand_balance": float(shortfall),
-                "tight_nodes": saturated_vertices,
-                "tight_edges": saturated_connections,
+                "demand_balance": float(deficit),
+                "tight_nodes": tight_nodes,
+                "tight_edges": tight_edges,
             },
         }
 
-    def _vertex_totals(self, flows: List[float]) -> Tuple[Dict[str, float], Dict[str, float]]:
-        inflows = defaultdict(float)
-        outflows = defaultdict(float)
-        for conn, amt in zip(self.connections, flows):
-            outflows[conn.start] += amt
-            inflows[conn.end] += amt
-        return inflows, outflows
-
-    def _find_reachable(
-        self,
-        flows: List[float],
-        leftovers: List[float],
-        inflows: Dict[str, float],
-        outflows: Dict[str, float],
-    ) -> set:
-        residual_graph = defaultdict(list)
-        for conn, amt in zip(self.connections, flows):
-            fwd_cap = conn.max_flow - amt
-            bwd_cap = amt - conn.min_flow
+    def _build_residual_graph(self, flows: List[float]) -> Dict[str, List[Tuple[str, float]]]:
+        """Build residual graph for min-cut computation"""
+        residual = defaultdict(list)
+        
+        for i, edge in enumerate(self.edges):
+            flow = flows[i]
+            # Forward capacity
+            fwd_cap = edge.upper - flow
             if fwd_cap > TOL:
-                residual_graph[conn.start].append((conn.end, fwd_cap))
+                residual[edge.src].append((edge.dst, fwd_cap))
+            # Backward capacity
+            bwd_cap = flow - edge.lower
             if bwd_cap > TOL:
-                residual_graph[conn.end].append((conn.start, bwd_cap))
-        master_supply = "__master_supply__"
-        residual_graph[master_supply] = []
-        for key in self.supply_keys:
-            idx = self.supply_map[key]
-            avail = self.supplies[key] - (outflows[key] - inflows[key])
-            avail = max(0.0, avail)
-            if avail > TOL:
-                residual_graph[master_supply].append((key, avail))
-            consumed = outflows[key] - inflows[key]
-            if consumed > TOL:
-                residual_graph[key].append((master_supply, consumed))
-        explored = {master_supply}
-        bfs_queue = deque([master_supply])
-        while bfs_queue:
-            curr = bfs_queue.popleft()
-            for neigh, cap in residual_graph.get(curr, []):
-                if cap <= TOL or neigh in explored:
-                    continue
-                explored.add(neigh)
-                bfs_queue.append(neigh)
-        return explored
+                residual[edge.dst].append((edge.src, bwd_cap))
+        
+        return residual
 
-    def _saturated_vertices(
-        self,
-        inflows: Dict[str, float],
-        outflows: Dict[str, float],
-        reachable: set,
-    ) -> List[str]:
-        saturated = []
-        for vert, limits in self.capacity_limits.items():
-            if vert not in reachable:
+    def _find_tight_nodes(self, flows: List[float], reachable: set) -> List[str]:
+        """Find nodes at capacity in the reachable set"""
+        tight = []
+        
+        for node, caps in self.node_caps.items():
+            if node not in reachable:
                 continue
-            in_total = inflows.get(vert, 0.0)
-            out_total = outflows.get(vert, 0.0)
-            if "throughput" in limits:
-                limit_val = limits["throughput"]
-                if limit_val - max(in_total, out_total) <= 1e-6:
-                    saturated.append(vert)
+            
+            inflow = sum(flows[i] for i, e in enumerate(self.edges) if e.dst == node)
+            outflow = sum(flows[i] for i, e in enumerate(self.edges) if e.src == node)
+            
+            if "throughput" in caps:
+                limit = caps["throughput"]
+                if max(inflow, outflow) >= limit - TOL:
+                    tight.append(node)
                     continue
-            if "in" in limits and limits["in"] - in_total <= 1e-6:
-                saturated.append(vert)
+            
+            if "in" in caps and inflow >= caps["in"] - TOL:
+                tight.append(node)
                 continue
-            if "out" in limits and limits["out"] - out_total <= 1e-6:
-                saturated.append(vert)
-        return sorted(set(saturated))
+            
+            if "out" in caps and outflow >= caps["out"] - TOL:
+                tight.append(node)
+        
+        return sorted(set(tight))
 
-    def _saturated_connections(
-        self,
-        flows: List[float],
-        reachable: set,
-        shortfall: float,
-    ) -> List[Dict[str, float]]:
-        saturated = []
-        for conn, amt in zip(self.connections, flows):
-            if conn.start in reachable and conn.end not in reachable:
-                remaining = conn.max_flow - amt
-                if remaining <= 1e-6:
-                    saturated.append(
-                        {
-                            "from": conn.start,
-                            "to": conn.end,
-                            "flow_needed": float(shortfall),
-                        }
-                    )
-        saturated.sort(key=lambda x: (x["from"], x["to"]))
-        return saturated
+    def _find_tight_edges(self, flows: List[float], reachable: set, deficit: float) -> List[Dict]:
+        """Find edges at capacity crossing the cut"""
+        tight = []
+        
+        for i, edge in enumerate(self.edges):
+            if edge.src in reachable and edge.dst not in reachable:
+                if flows[i] >= edge.upper - TOL:
+                    tight.append({
+                        "from": edge.src,
+                        "to": edge.dst,
+                        "flow_needed": float(deficit),
+                    })
+        
+        tight.sort(key=lambda x: (x["from"], x["to"]))
+        return tight
 
-def entry_point() -> None:
+
+def main():
     try:
-        input_data = json.load(sys.stdin)
-        optimizer = NetworkOptimizer(input_data)
-        outcome = optimizer.optimize()
-    except Exception as err:  # noqa: BLE001
-        outcome = {"status": "error", "message": str(err)}
-    json.dump(outcome, sys.stdout, separators=(",", ":"))
+        config = json.load(sys.stdin)
+        optimizer = BeltOptimizer(config)
+        result = optimizer.optimize()
+    except Exception as e:
+        result = {"status": "error", "message": str(e)}
+    json.dump(result, sys.stdout, separators=(",", ":"))
+
 
 if __name__ == "__main__":
-    entry_point()
+    main()
