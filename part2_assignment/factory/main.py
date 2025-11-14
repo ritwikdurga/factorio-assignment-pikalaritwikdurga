@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # factory/main.py
 
 import json

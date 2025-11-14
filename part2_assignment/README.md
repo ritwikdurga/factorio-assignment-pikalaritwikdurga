@@ -116,6 +116,12 @@ part2_assignment/
 
 ├─ belts/main.py             # transport CLI
 
+├─ bin/                      # wrapper scripts for direct invocation
+
+│  ├─ factory                # wrapper for factory command
+
+│  └─ belts                  # wrapper for belts command
+
 ├─ run_samples.py            # convenience runner for the sample fixtures
 
 ├─ requirements.txt          # SciPy dependency
@@ -147,3 +153,34 @@ part2_assignment/
 3. Execute the automated tests:  
 
    `FACTORY_CMD="python3 factory/main.py" BELTS_CMD="python3 belts/main.py" python3 -m pytest -q`
+
+## Usage
+
+Both tools read JSON from stdin and write JSON to stdout. You can use them in three ways:
+
+### Option 1: Using the wrapper scripts (recommended)
+
+```bash
+cd part2_assignment
+./bin/factory < input.json > output.json
+./bin/belts < input.json > output.json
+```
+
+### Option 2: Add `bin/` to your PATH to use them as `factory` and `belts`
+
+```bash
+cd part2_assignment
+export PATH=$PATH:$(pwd)/bin
+factory < input.json > output.json
+belts < input.json > output.json
+```
+
+### Option 3: Use the scripts directly (they're now executable)
+
+```bash
+cd part2_assignment
+./factory/main.py < input.json > output.json
+./belts/main.py < input.json > output.json
+```
+
+All three methods produce identical results. The tools are deterministic, have no side effects, and complete in ≤ 2 seconds on typical inputs.
